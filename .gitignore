@@ -1,0 +1,18 @@
+node_modules/
+*.tsbuildinfo
+.acceptance/
+.omp/agy-debug/
+.env
+.env.*
+!.env.example
+*.tgz
+
+# Historical workstation audits remain local; publish only the scrubbed contract.
+/docs/2026-11-17-architecture-re-audit.md
+/docs/2026-11-17-implementation-acceptance.md
+/docs/2026-11-17-implementation-audit.md
+/docs/2026-11-17-retrospective-critique-and-adjudication.md
+/docs/2026-11-17-retrospective-cross-review.md
+/docs/2026-11-18-post-fix-review-and-rework.md
+/docs/design.md
+/docs/adr/0001-native-omp-routing.md

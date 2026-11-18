@@ -1,0 +1,41 @@
+name: Verify bridge
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test --timeout 20000
+      - run: bun scripts/check-package.ts
+  windows-checkout:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Check Linux script bytes after Windows checkout
+        shell: pwsh
+        run: |
+          foreach ($file in (Get-ChildItem scripts/*.sh)) {
+            if ([IO.File]::ReadAllBytes($file.FullName).Contains([byte]13)) { throw "CR found in $file" }
+          }
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test test/runner.test.ts --timeout 20000
+  macos-native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test test/agent.test.ts test/runner-native.test.ts --timeout 20000
