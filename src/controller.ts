@@ -27,6 +27,8 @@ export interface ControllerCallbacks {
   debugContext?: () => DebugContext;
   diagnostic?: (message: string) => void;
   failed?: (error: Error) => void;
+  /** Opt in only for a dedicated, no-tool model discovery activation. */
+  observeModelWindows?: boolean;
 }
 export class ActivationCleanupError extends Error {
   constructor(readonly report: CleanupReport | undefined, reason: string) { super(`cleanup_failed: ${reason}`); }
@@ -35,6 +37,33 @@ const errorOf = (error: unknown): Error => error instanceof Error ? error : new 
 const metadataText = (meta: Record<string, unknown> | null | undefined, keys: string[]): string | undefined => {
   for (const key of keys) if (typeof meta?.[key] === "string" && meta[key]) return meta[key] as string;
 };
+
+const WINDOW_DISCOVERY_MS = 3_000;
+const WINDOW_STEP_MS = 200;
+const WINDOW_SETTLE_MS = 30;
+interface WindowObservation {
+  model: string;
+  configId: string;
+  fromSize?: number;
+  expectedSize?: number;
+  configSeen?: boolean;
+  size?: number;
+  settleAt?: number;
+  invalid?: boolean;
+}
+function windowModelSelector(options: acp.SessionConfigOption[]) {
+  let selector: Extract<acp.SessionConfigOption, { type: "select" }> | undefined;
+  for (const option of options) {
+    if (option.category !== "model" && option.id !== "model") continue;
+    if (selector || option.type !== "select") return undefined;
+    selector = option;
+  }
+  return selector;
+}
+function confirmsWindowModel(options: acp.SessionConfigOption[], observation: WindowObservation): boolean {
+  const selector = windowModelSelector(options);
+  return selector?.id === observation.configId && selector.currentValue === observation.model;
+}
 
 /** Merge only structured identities; human-readable titles and raw arguments never authorize. */
 export function mergeToolReport(previous: ReportedTool | undefined, tool: acp.ToolCallUpdate, publishedNames: ReadonlyMap<string, string>): ReportedTool {
@@ -91,6 +120,11 @@ export class SessionController {
   private thoughtOptions?: ThoughtOptions;
   private thoughtError?: ThinkingSelectionError;
   private selectingConfig = false;
+  private readonly observedWindows = new Map<string, number>();
+  private windowObservation?: WindowObservation;
+  private earlyWindowUpdates?: acp.SessionNotification[] | null;
+  private windowDiscovery = false;
+  private discoverySignal?: AbortSignal;
   private generatedModel?: string;
   private flights = new Map<number, Promise<void>>();
   private flightSequence = 0;
@@ -176,6 +210,8 @@ export class SessionController {
         const meta = initialized.agentCapabilities?._meta?.antigravity as { systemPrompt?: { append?: boolean } } | undefined;
         if (!meta?.systemPrompt?.append) throw new Error("default-agy explicit instructions require the advertised antigravity.systemPrompt.append capability");
       }
+      const observeWindows = !!callbacks.observeModelWindows && !tools.length && hostSystemPrompt === undefined;
+      if (observeWindows) controller.earlyWindowUpdates = [];
       const session = await controller.setupRequest(() => controller.connection!.agent.request(acp.methods.agent.session.new, {
         cwd: controller.prepared!.workspace, mcpServers: [],
         ...(append ? { _meta: { antigravity: { systemPrompt: { append } } } } : {}),
@@ -183,6 +219,16 @@ export class SessionController {
       controller.sessionId = session.sessionId;
       controller.configOptions = session.configOptions ?? [];
       controller.refreshModels();
+      if (observeWindows) {
+        controller.windowDiscovery = true;
+        controller.discoverySignal = signal;
+        const selector = windowModelSelector(controller.configOptions);
+        if (selector && controller.earlyWindowUpdates) {
+          controller.windowObservation = { model: selector.currentValue, configId: selector.id };
+          for (const notification of controller.earlyWindowUpdates) controller.observeWindowUpdate(notification);
+        }
+        controller.earlyWindowUpdates = undefined;
+      }
       if (!controller.models.length) throw new Error("Live ACP session advertised no permitted model choices; no fallback model was invented");
       await controller.waitForBridgeReady(signal);
       signal?.throwIfAborted();
@@ -268,22 +314,33 @@ export class SessionController {
   async selectModel(id: string): Promise<void> {
     if (this.phase !== "idle") throw new Error("ACP model selection requires an idle activation");
     if (this.selectingConfig) throw new Error("ACP configuration selection is already in progress");
+    this.windowObservation = undefined; // A caller selection ends the untouched startup baseline.
+    this.selectingConfig = true;
+    try { await this.selectModelOption(id); }
+    finally { this.selectingConfig = false; }
+  }
+
+  private async selectModelOption(id: string, signal?: AbortSignal, force = false, observation?: WindowObservation): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.phase !== "idle") throw new Error("ACP model selection requires an idle activation");
     if (!this.models.some(model => model.id === id)) throw new Error(`Model '${id}' is not advertised by this live ACP session`);
     const selector = this.modelSelector();
     if (!selector || !this.connection) throw new Error("ACP model selector unavailable");
-    if (selector.currentValue === id) return;
-    this.selectingConfig = true;
-    this.contextUsage = undefined;
-    this.generatedModel = undefined;
-    this.wake();
-    try {
-      const response = await this.setupRequest(() => this.connection!.agent.request(acp.methods.agent.session.setConfigOption, {
-        sessionId: this.sessionId, configId: selector.id, value: id,
-      }));
-      this.configOptions = response.configOptions;
-      this.refreshModels();
-      if (this.selectedModel !== id || !this.models.some(model => model.id === id)) throw new Error(`ACP did not confirm model '${id}'; no fallback was selected`);
-    } finally { this.selectingConfig = false; }
+    if (!force && selector.currentValue === id) return;
+    if (!observation) {
+      this.contextUsage = undefined;
+      this.generatedModel = undefined;
+      this.wake();
+    }
+    const response = await this.setupRequest(combined => this.connection!.agent.request(acp.methods.agent.session.setConfigOption, {
+      sessionId: this.sessionId, configId: selector.id, value: id,
+    }, signal ? { cancellationSignal: combined, stopWaitingOnCancel: true } : undefined), signal);
+    signal?.throwIfAborted();
+    this.setupAbort.signal.throwIfAborted();
+    if (observation && !confirmsWindowModel(response.configOptions, observation)) throw new Error("ACP window transition was not confirmed");
+    this.configOptions = response.configOptions;
+    this.refreshModels();
+    if (this.selectedModel !== id || !this.models.some(model => model.id === id)) throw new Error(`ACP did not confirm model '${id}'; no fallback was selected`);
   }
 
   get thinking(): ThoughtOptions | undefined {
@@ -291,17 +348,134 @@ export class SessionController {
     return this.thoughtOptions;
   }
 
+  /** Exact empirical empty-session windows, not backend limits or generated usage. */
+  get modelContextWindows(): ReadonlyMap<string, number> { return this.observedWindows; }
+
   async discoverModelOptions(): Promise<AdvertisedModel[]> {
     if (this.phase !== "idle") throw new Error("ACP model discovery requires an idle activation");
+    if (this.selectingConfig) throw new Error("ACP configuration selection is already in progress");
     // Model selection replaces the live list; iterate only the initially permitted inventory.
     const models = this.models.map(model => ({ id: model.id, name: model.name }));
-    const discovered: AdvertisedModel[] = [];
-    for (const model of models) {
-      await this.selectModel(model.id);
-      const thought = this.thinking;
-      discovered.push({ ...model, ...(thought ? { thinking: thought } : {}) });
+    const signal = this.discoverySignal;
+    this.discoverySignal = undefined;
+    this.selectingConfig = true;
+    try {
+      signal?.throwIfAborted();
+      const windowsSettled = !this.windowObservation || await this.discoverWindows(models, this.windowObservation, signal);
+      const discovered: AdvertisedModel[] = [];
+      for (const model of models) {
+        // If a probe failed, never trust a config snapshot that might still describe a late transition.
+        await this.selectModelOption(model.id, signal, !windowsSettled);
+        const thought = this.thinking;
+        discovered.push({ ...model, ...(thought ? { thinking: thought } : {}) });
+      }
+      signal?.throwIfAborted();
+      this.setupAbort.signal.throwIfAborted();
+      return discovered;
+    } finally { this.windowObservation = undefined; this.selectingConfig = false; }
+  }
+
+  private async discoverWindows(models: AdvertisedModel[], initial: WindowObservation, owner?: AbortSignal): Promise<boolean> {
+    const signal = AbortSignal.any([this.setupAbort.signal, ...(owner ? [owner] : [])]);
+    const deadline = performance.now() + WINDOW_DISCOVERY_MS;
+    let attemptedSwitch = false;
+    try {
+      const ids = [...new Set(models.map(model => model.id))];
+      const alternate = ids.at(-1) === initial.model ? ids.at(-2) : ids.at(-1);
+      if (ids.length < 2 || alternate === undefined || initial.invalid) return true;
+      let current = { id: initial.model, size: await this.observeWindowStep(initial, deadline, signal) };
+      const move = async (id: string, expectedSize?: number) => {
+        if (this.windowObservation?.invalid || this.selectedModel !== current.id || this.modelSelector()?.id !== initial.configId || id === current.id) {
+          throw new Error("ACP lost its observed window baseline");
+        }
+        attemptedSwitch = true;
+        const observation = { model: id, configId: initial.configId, fromSize: current.size, expectedSize };
+        current = { id, size: await this.observeWindowStep(observation, deadline, signal) };
+        return current;
+      };
+
+      // The unswitched default is a starting measurement even if it is excluded by policy.
+      // Never switch back to it unless it is in the permitted inventory.
+      let anchor = current;
+      let other = await move(alternate);
+      if (!ids.includes(anchor.id)) {
+        anchor = other;
+        other = await move(ids.find(id => id !== anchor.id)!);
+      }
+      await move(anchor.id, anchor.size);
+      await move(other.id, other.size);
+      this.observedWindows.set(other.id, other.size);
+      await move(anchor.id, anchor.size);
+      this.observedWindows.set(anchor.id, anchor.size);
+
+      // Use the smaller measured anchor for unknown targets. Silence is not a measurement,
+      // so a failed transition ends this pass rather than risking attribution on another one.
+      const baseline = anchor.size < other.size ? anchor : other;
+      for (const id of ids) {
+        if (this.observedWindows.has(id)) continue;
+        if (current.id !== baseline.id) await move(baseline.id, baseline.size);
+        const first = await move(id);
+        await move(baseline.id, baseline.size);
+        await move(id, first.size);
+        this.observedWindows.set(id, first.size);
+      }
+      return true;
+    } catch {
+      signal.throwIfAborted();
+      return !attemptedSwitch;
+    } finally { this.windowObservation = undefined; }
+  }
+
+  private async observeWindowStep(observation: WindowObservation, deadline: number, signal: AbortSignal): Promise<number> {
+    const timeout = Math.min(deadline, performance.now() + WINDOW_STEP_MS);
+    const cutoff = new AbortController();
+    const step = AbortSignal.any([signal, cutoff.signal]);
+    const advance = () => cutoff.abort(new Error("ACP window observation timed out"));
+    this.windowObservation = observation;
+    if (performance.now() >= timeout) advance();
+    const timer = setTimeout(advance, Math.max(0, Math.ceil(timeout - performance.now())));
+    try {
+      step.throwIfAborted();
+      if (observation.fromSize !== undefined) {
+        await this.selectModelOption(observation.model, step, true, observation);
+        // A notification received before the response still needs the exact RPC confirmation.
+        if (observation.size !== undefined) observation.settleAt = performance.now() + WINDOW_SETTLE_MS;
+      }
+      for (;;) {
+        const previous = this.version;
+        if (performance.now() >= timeout) advance();
+        step.throwIfAborted();
+        if (observation.invalid) throw new Error("ACP window evidence is ambiguous");
+        if (observation.size === undefined) { await this.wait(previous, step); continue; }
+        const remaining = observation.settleAt! - performance.now();
+        if (remaining <= 0) return observation.size;
+        // Keep the same observation open briefly to catch contradictions before sending another switch.
+        const quiet = new AbortController();
+        const settleTimer = setTimeout(() => quiet.abort(), Math.ceil(remaining));
+        try { await this.wait(previous, AbortSignal.any([step, quiet.signal])); }
+        finally { clearTimeout(settleTimer); }
+      }
+    } finally { clearTimeout(timer); }
+  }
+
+  private observeWindowUpdate({ sessionId, update }: acp.SessionNotification): void {
+    const observation = this.windowObservation;
+    if (!observation || observation.invalid) return;
+    if (sessionId !== this.sessionId) observation.invalid = true;
+    else if (update.sessionUpdate === "config_option_update") {
+      if (!confirmsWindowModel(update.configOptions, observation)) observation.invalid = true;
+      else observation.configSeen = true;
+    } else if (update.sessionUpdate === "usage_update") {
+      if (update.used !== 0 || !Number.isSafeInteger(update.size) || update.size <= 0 ||
+          (observation.fromSize !== undefined && (!observation.configSeen || update.size === observation.fromSize || observation.size !== undefined)) ||
+          (observation.size !== undefined && update.size !== observation.size) ||
+          (observation.expectedSize !== undefined && update.size !== observation.expectedSize)) observation.invalid = true;
+      else {
+        observation.size = update.size;
+        observation.settleAt = performance.now() + WINDOW_SETTLE_MS;
+      }
     }
-    return discovered;
+    this.wake();
   }
 
   async selectThinking(options: { reasoning?: string; disableReasoning?: boolean }): Promise<void> {
@@ -316,6 +490,7 @@ export class SessionController {
       const model = this.selectedModel;
       if (!model || !this.models.some(option => option.id === model)) throw new ThinkingSelectionError("ACP model is not confirmed for thinking selection");
       if (thought.currentValue === value) return;
+      this.windowObservation = undefined;
       this.selectingConfig = true;
       try {
         const response = await this.setupRequest(() => this.connection!.agent.request(acp.methods.agent.session.setConfigOption, {
@@ -362,6 +537,9 @@ export class SessionController {
   begin(prompt: acp.ContentBlock[]): void {
     if (this.phase !== "idle") throw new Error(`Cannot start ACP turn while ${this.phase}`);
     if (this.selectingConfig) throw new Error("Cannot start ACP turn before configuration selection is confirmed");
+    this.windowObservation = undefined;
+    this.windowDiscovery = false;
+    this.discoverySignal = undefined;
     this.generatedModel = this.selectedModel;
     this.bridge.beginTurn(); this.phase = "active"; this.reports.clear();
     try { this.launch(prompt); }
@@ -453,13 +631,25 @@ export class SessionController {
   }
 
   private update(notification: acp.SessionNotification): void {
+    const kind = notification.update.sessionUpdate;
+    if (kind === "usage_update" || kind === "config_option_update") {
+      if (this.earlyWindowUpdates !== undefined) {
+        // Notifications can precede session/new's response. Do not bind a session ID by arrival order.
+        if (this.earlyWindowUpdates && this.earlyWindowUpdates.length < 8) this.earlyWindowUpdates.push(notification);
+        else this.earlyWindowUpdates = null; // Overflow invalidates the startup observation.
+        return;
+      }
+      this.observeWindowUpdate(notification);
+      if (this.windowDiscovery && notification.sessionId !== this.sessionId) return;
+      // Use RPC responses as the live config snapshot throughout dedicated discovery, including fallback.
+      if (this.windowDiscovery && this.selectingConfig) return;
+    }
     if (this.sessionId && notification.sessionId !== this.sessionId) { void this.fail(new Error("ACP session notification identity mismatch")); return; }
     const update = notification.update;
     switch (update.sessionUpdate) {
       case "available_commands_update": this.counters.ignoredCommandUpdates++; return;
       case "usage_update":
-        // ACP usage is unlabelled: setup/selection events cannot prove model ownership.
-        // A new model remains unknown until this activation actually starts generation.
+        // The generation display is separate from empty-session window observations.
         if (this.selectingConfig || !this.selectedModel || this.generatedModel !== this.selectedModel || (this.phase !== "active" && this.phase !== "idle")) return;
         this.contextUsage = { used: update.used, size: update.size, cost: update.cost }; this.wake(); return;
       case "config_option_update": this.configOptions = update.configOptions; this.refreshModels(); this.wake(); return;
@@ -552,6 +742,9 @@ export class SessionController {
   }
   stop(reason = new Error("AGY activation stopped")): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
+    this.windowObservation = undefined;
+    this.earlyWindowUpdates = undefined;
+    this.discoverySignal = undefined;
     this.phase = "stopping"; this.setupAbort.abort(reason); this.wake();
     this.stopPromise = Promise.resolve().then(async () => {
       const candidate = this.candidate;
@@ -588,7 +781,7 @@ export class SessionController {
 
 /** Discover against a real no-generation session; cleanup is mandatory before returning. */
 export async function discoverModels(config: SessionConfig, { bootstrap, signal }: { bootstrap?: RunnerFactory; signal?: AbortSignal } = {}): Promise<ModelDiscovery> {
-  const controller = await SessionController.open(discoveryConfig(config), [], {}, signal, undefined, bootstrap);
+  const controller = await SessionController.open(discoveryConfig(config), [], { observeModelWindows: true }, signal, undefined, bootstrap);
   let result: ModelDiscovery;
   try {
     result = { models: await controller.discoverModelOptions(), images: !!controller.capabilities.image, evidence: {} };

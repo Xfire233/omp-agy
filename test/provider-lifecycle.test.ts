@@ -42,6 +42,7 @@ class ControlledController {
   selectedModel?: string = model.id;
   contextUsage?: SessionController["contextUsage"];
   models: AdvertisedModel[] = [{ id: "gemini-4-argon", name: "Published fixture model" }, { id: "gemini-4-hydrogen", name: "Requested nondefault model" }];
+  modelContextWindows?: ReadonlyMap<string, number>;
   thinking?: ThoughtOptions;
   thinkingCalls: (string | undefined)[] = [];
   beginThinking: (string | undefined)[] = [];
@@ -870,16 +871,22 @@ describe("provider lifecycle regressions", () => {
   });
   test("cancelled rediscovery releases only its stopped controller and retains the last published catalog", async () => {
     const published = new ControlledController(); const cancelled = new ControlledController();
+    published.modelContextWindows = new Map([[model.id, 650000]]);
     cancelled.models = [{ id: "cancelled-model", name: "Never published" }];
+    cancelled.modelContextWindows = new Map([[cancelled.models[0]!.id, 700000]]);
     const stopping = Promise.withResolvers<void>(); const cleanup = Promise.withResolvers<void>(); let stopPromise: Promise<void> | undefined;
     cancelled.stop = () => stopPromise ??= (async () => { cancelled.phase = "stopping"; stopping.resolve(); await cleanup.promise; cancelled.phase = "stopped"; })();
     let index = 0; const open = spyOn(SessionController, "open").mockImplementation(async () => [published, cancelled][index++] as unknown as SessionController);
     try {
       const runtime = new ProviderRuntime(readConfig({})); const models = await runtime.discover(); expect(models[0]!.id).toBe("gemini-4-argon");
+      const evidence = runtime.discoveredContextWindows;
       const discovery = runtime.discover().then(() => undefined, error => error); await stopping.promise;
       const stop = runtime.stop("cancel rediscovery", false); cleanup.resolve();
       expect(await discovery).toMatchObject({ name: "AbortError" }); await stop;
       expect(runtime.snapshot().advertisedModels).toEqual(published.models); expect(runtime.snapshot().phase).toBe("stopped");
+      expect(runtime.discoveredContextWindows).toBe(evidence);
+      expect(evidence?.get(model.id)).toBe(650000);
+      expect(evidence?.get(cancelled.models[0]!.id)).toBeUndefined();
       expect(cancelled.beginCalls).toBe(0);
     } finally { cleanup.resolve(); open.mockRestore(); }
   });
@@ -931,12 +938,13 @@ describe("provider lifecycle regressions", () => {
     try {
       const runtime = new ProviderRuntime(readConfig({ OMP_AGY_CONTEXT_WINDOW: "400000" }));
       expect((await runtime.discover()).map(row => [row.id, row.contextWindow])).toEqual([["gpt-oss-120b-medium", 131072], [model.id, 400000], ["future-live-model", 400000]]);
-      const diagnostics = JSON.stringify(runtime.snapshot().diagnostics);
-      expect(diagnostics).toContain("clamped to known ceiling 131072"); expect(diagnostics).toContain("capacity unknown; using local budget 400000");
+      const diagnostics = runtime.snapshot().diagnostics as string[];
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("clamped to known ceiling 131072");
       expect(controller.beginCalls).toBe(0); expect(controller.phase).toBe("stopped");
     } finally { open.mockRestore(); }
   });
-  test("future live models and CLI versions use honest local budgets and can generate without retries", async () => {
+  test("unknown capacities use local budgets without warnings on discovery or repeated calls", async () => {
     for (const unknownVersion of [true, false]) for (const requested of [undefined, "200000", "600000"]) {
       const id = unknownVersion ? "gpt-oss-120b-medium" : "future-live-model";
       const controllers = [new ControlledController(), new ControlledController()]; let index = 0;
@@ -947,14 +955,17 @@ describe("provider lifecycle regressions", () => {
       const open = spyOn(SessionController, "open").mockImplementation(async () => controllers[index++] as unknown as SessionController);
       try {
         const runtime = new ProviderRuntime(readConfig(requested === undefined ? {} : { OMP_AGY_CONTEXT_WINDOW: requested }));
+        const warnings: string[] = []; runtime.onDiagnostic = text => warnings.push(text);
         const budget = requested === undefined ? 400000 : Number(requested);
         expect((await runtime.discover()).map(row => [row.id, row.contextWindow])).toEqual([[id, budget]]);
-        expect((await runtime.stream({ ...model, id, contextWindow: budget }, { messages: [initial] }).result()).stopReason).toBe("stop");
+        const selected = { ...model, id, contextWindow: budget };
+        const first = await runtime.stream(selected, { messages: [initial] }).result();
+        expect(first.stopReason).toBe("stop");
+        const followup: UserMessage = { ...initial, content: "another turn with the same local budget" };
+        expect((await runtime.stream(selected, { messages: [initial, first, followup] }).result()).stopReason).toBe("stop");
         expect(controllers[0]!.beginCalls).toBe(0); expect(controllers[0]!.phase).toBe("stopped");
-        expect(controllers[1]!.beginCalls).toBe(1); expect(controllers[1]!.selectCalls).toBe(1); expect(open).toHaveBeenCalledTimes(2);
-        const diagnostics = JSON.stringify(runtime.snapshot().diagnostics);
-        expect(diagnostics).toContain("capacity unknown"); expect(diagnostics).toContain(`local budget ${budget}`);
-        expect(diagnostics).toContain("not a verified native ceiling");
+        expect(controllers[1]!.beginCalls).toBe(2); expect(controllers[1]!.selectCalls).toBe(1); expect(open).toHaveBeenCalledTimes(2);
+        expect(warnings).toEqual([]); expect(runtime.snapshot().diagnostics).toEqual([]);
       } finally { open.mockRestore(); }
     }
   });
@@ -966,16 +977,137 @@ describe("provider lifecycle regressions", () => {
       expect(controller.beginCalls).toBe(0); expect(controller.phase).toBe("stopped");
     } finally { open.mockRestore(); }
   });
-  test("unknown-capacity diagnostics stay bounded without dropping a large future-model catalog", async () => {
+  test("large future-model catalogs are registered without discovery warning spam", async () => {
     const controller = new ControlledController();
     controller.models = [...Array.from({ length: 30 }, (_, index) => ({ id: `unknown-${index}-${"x".repeat(1000)}`, name: "Unknown" })), { id: model.id, name: model.name }];
     const open = spyOn(SessionController, "open").mockResolvedValue(controller as unknown as SessionController);
     try {
-      const runtime = new ProviderRuntime(readConfig({})); expect(await runtime.discover()).toHaveLength(31);
-      const diagnostics = runtime.snapshot().diagnostics as string[];
-      expect(diagnostics.filter(text => text.startsWith("AGY context budget for"))).toHaveLength(8);
-      expect(diagnostics.some(text => text.includes("22 additional clamped or capacity-unknown live models"))).toBe(true);
-      expect(diagnostics.every(text => text.length < 700)).toBe(true);
+      const runtime = new ProviderRuntime(readConfig({}));
+      const warnings: string[] = []; runtime.onDiagnostic = text => warnings.push(text);
+      expect(await runtime.discover()).toHaveLength(31);
+      expect(warnings).toEqual([]); expect(runtime.snapshot().diagnostics).toEqual([]);
+    } finally { open.mockRestore(); }
+  });
+  test("discovery prefers trusted exact-model capacities, clamps configuration, and snapshots only live rows", async () => {
+    const controller = new ControlledController();
+    const small = "gpt-oss-120b-medium";
+    const invalid = "gemini-4-hydrogen";
+    const future = "future-live-model";
+    controller.models = [model.id, small, invalid, future].map(id => ({ id, name: id }));
+    const capacities = new Map([[model.id, 640000], [small, 800000], [invalid, 0], [future.toUpperCase(), 900000]]);
+    controller.modelContextWindows = capacities;
+    const stop = controller.stop.bind(controller);
+    controller.stop = async () => { capacities.clear(); await stop(); };
+    const open = spyOn(SessionController, "open").mockResolvedValue(controller as unknown as SessionController);
+    try {
+      const runtime = new ProviderRuntime(readConfig({ OMP_AGY_CONTEXT_WINDOW: "700000" }));
+      const rows = await runtime.discover();
+      expect(rows.map(row => [row.id, row.contextWindow])).toEqual([[model.id, 640000], [small, 700000], [invalid, 700000], [future, 700000]]);
+      const discovery = runtime.discoveredContextWindows;
+      expect(discovery?.version).toBe("1.5.10");
+      expect(discovery?.get(small)).toBe(800000);
+      expect(discovery?.get(invalid)).toBeUndefined();
+      expect(discovery?.get(future.toUpperCase())).toBeUndefined();
+      expect(controller.beginCalls).toBe(0); expect(controller.stopCalls).toBe(1);
+    } finally { open.mockRestore(); }
+  });
+  test("admission keeps discovered capacity without fresh metadata, re-clamps it, and prefers fresh capacity", async () => {
+    const id = "future-live-model";
+    const discovery = new ControlledController(); const live = new ControlledController();
+    for (const controller of [discovery, live]) controller.models = [{ id, name: id }];
+    discovery.modelContextWindows = new Map([[id, 650000]]);
+    let index = 0;
+    const open = spyOn(SessionController, "open").mockImplementation(async () => [discovery, live][index++] as unknown as SessionController);
+    try {
+      const runtime = new ProviderRuntime(readConfig({ OMP_AGY_CONTEXT_WINDOW: "500000" }));
+      const [row] = await runtime.discover();
+      expect(row!.contextWindow).toBe(500000);
+      const warnings: string[] = []; runtime.onDiagnostic = text => warnings.push(text);
+      const first = await runtime.stream({ ...model, id, contextWindow: row!.contextWindow }, { messages: [initial] }).result();
+      expect(first.stopReason).toBe("stop");
+      expect(open.mock.calls[0]?.[2]?.observeModelWindows).toBe(true);
+      expect(open.mock.calls[1]?.[2]?.observeModelWindows).toBeUndefined();
+      const history = { messages: [initial, first, { ...initial, content: "use the discovered capacity again" }] };
+      runtime.config = { ...runtime.config, contextWindow: 600000 };
+      live.modelContextWindows = new Map([[id, 550000]]);
+      const stale = await runtime.stream({ ...model, id, contextWindow: 600000 }, history).result();
+      expect(stale.errorMessage).toContain("runtime's context budget 550000");
+      expect(live.beginCalls).toBe(1); expect(live.stopCalls).toBe(0);
+      live.modelContextWindows = new Map();
+      const oversized = await runtime.stream({ ...model, id, contextWindow: 600001 }, history).result();
+      expect(oversized.errorMessage).toContain("runtime's context budget 600000");
+      expect((await runtime.stream({ ...model, id, contextWindow: 600000 }, history).result()).stopReason).toBe("stop");
+      expect(live.beginCalls).toBe(2); expect(warnings).toEqual([]);
+    } finally { open.mockRestore(); }
+  });
+  test("rediscovery without an entry forgets the old model capacity even under the same CLI version", async () => {
+    const id = "future-live-model";
+    const discovery = new ControlledController(); const rediscovery = new ControlledController(); const live = new ControlledController();
+    for (const controller of [discovery, rediscovery, live]) controller.models = [{ id, name: id }, { id: model.id, name: model.name }];
+    discovery.modelContextWindows = new Map([[id, 650000]]);
+    rediscovery.modelContextWindows = new Map([[model.id, 550000]]);
+    let index = 0;
+    const open = spyOn(SessionController, "open").mockImplementation(async () => [discovery, rediscovery, live][index++] as unknown as SessionController);
+    try {
+      const runtime = new ProviderRuntime(readConfig({}));
+      expect((await runtime.discover())[0]!.contextWindow).toBe(650000);
+      expect((await runtime.discover())[0]!.contextWindow).toBe(400000);
+      expect(runtime.discoveredContextWindows?.get(id)).toBeUndefined();
+      expect(runtime.discoveredContextWindows?.get(model.id)).toBe(550000);
+      const stale = await runtime.stream({ ...model, id, contextWindow: 650000 }, { messages: [initial] }).result();
+      expect(stale.errorMessage).toContain("runtime's context budget 400000");
+      expect(live.beginCalls).toBe(0);
+    } finally { open.mockRestore(); }
+  });
+  test("discovery evidence does not cross CLI versions or configured and explicit account switches", async () => {
+    for (const changed of ["version", "runner", "account"] as const) {
+      const id = "future-live-model";
+      const discovery = new ControlledController(); const live = new ControlledController();
+      for (const controller of [discovery, live]) controller.models = [{ id, name: id }];
+      discovery.modelContextWindows = new Map([[id, 650000]]);
+      let index = 0;
+      const open = spyOn(SessionController, "open").mockImplementation(async () => [discovery, live][index++] as unknown as SessionController);
+      try {
+        const runtime = new ProviderRuntime(readConfig({}));
+        await runtime.discover();
+        if (changed === "version") live.runner.evidence.version = "1.5.11";
+        if (changed === "runner") runtime.config = readConfig({ OMP_AGY_ACCOUNT_DIRECTORY: "/home/agy/.gemini/other-account" });
+        if (changed === "account") await runtime.withAccountLogin(async () => {});
+        const stale = await runtime.stream({ ...model, id, contextWindow: 650000 }, { messages: [initial] }).result();
+        expect(stale.errorMessage).toContain("runtime's context budget 400000");
+        expect(live.selectCalls).toBe(0); expect(live.beginCalls).toBe(0);
+      } finally { open.mockRestore(); }
+    }
+  });
+  test("borrowed evidence follows the host's current publication and does not fall back to an invalidated local snapshot", async () => {
+    const id = "future-live-model";
+    const discovery = new ControlledController(); const childLive = new ControlledController(); const parentLive = new ControlledController();
+    for (const controller of [discovery, childLive, parentLive]) controller.models = [{ id, name: id }];
+    discovery.modelContextWindows = new Map([[id, 650000]]);
+    let index = 0;
+    const open = spyOn(SessionController, "open").mockImplementation(async () => [discovery, childLive, parentLive][index++] as unknown as SessionController);
+    try {
+      const parent = new ProviderRuntime(readConfig({})); const child = new ProviderRuntime(readConfig({}));
+      await parent.discover();
+      let published = parent.discoveredContextWindows;
+      parent.getPublishedContextWindows = child.getPublishedContextWindows = version => published?.version === version ? published : undefined;
+      const selected = { ...model, id, contextWindow: 650000 };
+      expect((await child.stream(selected, { messages: [initial] }, { cwd: "another-host-directory" }).result()).stopReason).toBe("stop");
+      published = undefined;
+      const stale = await parent.stream(selected, { messages: [initial] }).result();
+      expect(stale.errorMessage).toContain("runtime's context budget 400000");
+      expect(childLive.beginCalls).toBe(1); expect(parentLive.beginCalls).toBe(0);
+    } finally { open.mockRestore(); }
+  });
+  test("discovery with an unprobed version does not publish portable capacity evidence", async () => {
+    const controller = new ControlledController(); const id = "future-live-model";
+    controller.models = [{ id, name: id }]; controller.runner.evidence.version = "not probed";
+    controller.modelContextWindows = new Map([[id, 650000]]);
+    const open = spyOn(SessionController, "open").mockResolvedValue(controller as unknown as SessionController);
+    try {
+      const runtime = new ProviderRuntime(readConfig({}));
+      expect((await runtime.discover())[0]!.contextWindow).toBe(400000);
+      expect(runtime.discoveredContextWindows).toBeUndefined();
     } finally { open.mockRestore(); }
   });
   test("known small models generate at their ceiling, but raw oversized registry budgets cannot be clamped into acceptance", async () => {

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, ProviderModelConfig, SourceInfo } from "@oh-my-pi/pi-coding-agent";
 import { readConfig, type AgyConfig } from "./src/config.ts";
-import { API_ID, PROVIDER_ID, ProviderRuntime } from "./src/provider.ts";
+import { API_ID, PROVIDER_ID, ProviderRuntime, type DiscoveredContextWindows } from "./src/provider.ts";
 import { SessionController, discoverModels } from "./src/controller.ts";
 import { bindProviderSession, routeProviderStream, unbindProviderSession } from "./src/router.ts";
 import { encodeHostToolResult } from "./src/provenance.ts";
@@ -15,25 +15,25 @@ import { openAccountLogin, validateAccountLogin } from "./src/account-login.ts";
 // OMP clears source registrations while preparing children sharing its registry.
 // Republish only immutable model rows from successfully cleaned live discoveries;
 // never persist them or share a controller, endpoint, pending tool or credential.
-const liveCatalogs = new Map<string, readonly ProviderModelConfig[]>();
+const liveCatalogs = new Map<string, { rows: readonly ProviderModelConfig[]; windows?: DiscoveredContextWindows }>();
 let catalogEpoch = 0;
 let catalogLoginInProgress = false;
 function catalogKey(config: AgyConfig): string {
   const { discovery: _discovery, debug: _debug, ...effective } = config;
   return canonical({ ...effective, runner: { ...DEFAULT_RUNNER_CONFIG, ...config.runner } });
 }
-function rememberCatalog(key: string, models: ProviderModelConfig[]): void {
+function rememberCatalog(key: string, models: ProviderModelConfig[], windows?: DiscoveredContextWindows): void {
   const rows = structuredClone(models);
   for (const row of rows) {
     Object.freeze(row.input); Object.freeze(row.cost);
     if (row.thinking) { Object.freeze(row.thinking.efforts); Object.freeze(row.thinking); }
     Object.freeze(row);
   }
-  liveCatalogs.set(key, Object.freeze(rows));
+  liveCatalogs.set(key, { rows: Object.freeze(rows), windows });
 }
 function publishedModels(key: string): ProviderModelConfig[] {
   const models = new Map<string, ProviderModelConfig>();
-  for (const [source, rows] of liveCatalogs) for (const row of rows) {
+  for (const [source, { rows }] of liveCatalogs) for (const row of rows) {
     const previous = models.get(row.id);
     const name = source === key ? row.name : previous?.name ?? `${row.name} [configuration-specific availability]`;
     const efforts = row.reasoning && row.thinking
@@ -53,6 +53,10 @@ function publishedModels(key: string): ProviderModelConfig[] {
 /** OMP rebinds this factory for children; no controller or queue lives at module scope. */
 export default async function extension(pi: ExtensionAPI): Promise<void> {
   const runtime = new ProviderRuntime(readConfig());
+  runtime.getPublishedContextWindows = version => {
+    const windows = liveCatalogs.get(catalogKey(runtime.config))?.windows;
+    return windows?.version === version ? windows : undefined;
+  };
   const debug = new DebugTrace();
   runtime.debug = debug;
   if (runtime.config.debug) await debug.enable(runtime.config.debug.directory, runtime.config.debug.mode);
@@ -113,7 +117,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     const key = catalogKey(runtime.config);
     const models = await runtime.discover();
     if (epoch !== catalogEpoch) throw new Error("An AGY account login attempt invalidated this discovery. Run /agy-discover again after the terminal closes.");
-    rememberCatalog(key, models);
+    rememberCatalog(key, models, runtime.discoveredContextWindows);
     publish(); discoveryError = undefined;
     return models;
   };
@@ -144,7 +148,12 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     handler: async (_args, ctx) => {
       try {
         const models = await register();
-        ctx.ui.notify(`AGY live model catalog refreshed for this configuration: ${models.map(model => model.id).join(", ")}. Use /agy <exact-model-id> to select. Other in-process configurations may have different availability.`, "info");
+        const observed = runtime.discoveredContextWindows;
+        const rows = models.map(({ id, contextWindow }) => {
+          const window = observed?.get(id);
+          return `${id}: OMP ${contextWindow}${window === undefined ? "" : ` (AGY observed ${window})`}`;
+        });
+        ctx.ui.notify(`AGY live model catalog refreshed for this configuration${observed ? ` (CLI ${observed.version})` : ""}:\n${rows.join("\n")}\nUse /agy <exact-model-id> to select.`, "info");
       }
       catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
     },

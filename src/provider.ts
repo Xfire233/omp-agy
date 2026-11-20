@@ -13,7 +13,7 @@ import { ContextLedger, canonical, encodeMessages, messageKey, steeringText, val
 import type { AgyConfig } from "./config.ts";
 import type { TrustedResult } from "./results.ts";
 import { normalizeOmpSystemPrompt, resetRunner, type RunnerResetReport } from "./runner.ts";
-import { ContextLimitError, contextLimitFor, resolveContextWindow } from "./context-limits.ts";
+import { ContextLimitError, resolveContextWindow } from "./context-limits.ts";
 import { thinkingMetadata } from "./thinking.ts";
 import { discoveryConfig, ThinkingSelectionError } from "./protocol.ts";
 import { debugEvent, type DebugObserver } from "./debug.ts";
@@ -55,6 +55,30 @@ export const isSteeringQuarantineRecord = new Ajv().compile<SteeringQuarantineRe
 });
 const steeringIdentity = (message: UserMessage | DeveloperMessage): string => canonical({ timestamp: message.timestamp, message: messageKey(message) });
 
+export interface DiscoveredContextWindows {
+  readonly version: string;
+  readonly get: (modelId: string) => number | undefined;
+}
+
+function contextCatalogIdentity({ runner, profile, instructions, allowedModels }: AgyConfig): string {
+  // The requested budget is deliberately excluded: clamp raw capacity again at admission.
+  return canonical({ runner, profile, instructions, allowedModels });
+}
+
+function trustedContextWindow(windows: ReadonlyMap<string, number> | undefined, modelId: string): number | undefined {
+  const window = windows?.get(modelId);
+  return window !== undefined && Number.isSafeInteger(window) && window > 0 ? window : undefined;
+}
+
+function contextBudget(version: string, modelId: string, requested: number | undefined, capacity: number | undefined): number {
+  if (capacity === undefined) return resolveContextWindow(version, modelId, requested);
+  if (requested === undefined) return capacity;
+  if (!Number.isSafeInteger(requested) || requested <= 0) {
+    throw new ContextLimitError("AGY contextWindow / OMP_AGY_CONTEXT_WINDOW must be a positive safe integer; no prompt was submitted.");
+  }
+  return Math.min(requested, capacity);
+}
+
 /** Live status ownership only; discovery evidence and stopped activations are absent. */
 export interface ProviderDisplayState {
   generation: number;
@@ -83,7 +107,7 @@ export class ProviderRuntime {
   private systemDiagnosticShown = false;
   private invocations = 0;
   private rebuilds = 0;
-  private lastDiscovery?: ModelDiscovery;
+  private lastDiscovery?: ModelDiscovery & { contextWindows?: DiscoveredContextWindows; identity: string };
   private diagnostics: string[] = [];
   private expectedTool?: { id: string; name: string; arguments: Record<string, unknown> };
   private deferredInput: (UserMessage | DeveloperMessage)[] = [];
@@ -94,6 +118,7 @@ export class ProviderRuntime {
   private stopBarrier?: Promise<void>;
   private epoch = 0;
   onDiagnostic?: (message: string) => void;
+  getPublishedContextWindows?: (version: string) => DiscoveredContextWindows | undefined;
   onUncertainSteering?: (record: SteeringQuarantineRecord) => void;
   resultForTool?: (toolName: string, result: ToolResultMessage) => TrustedResult;
   debug?: DebugObserver;
@@ -143,11 +168,17 @@ export class ProviderRuntime {
     if (!inputs) this.dirtyInputs.set(attempt.sessionId, inputs = new Set());
     for (const input of attempt.inputs) inputs.add(input);
   }
+  get discoveredContextWindows(): DiscoveredContextWindows | undefined {
+    return this.lastDiscovery?.contextWindows && this.lastDiscovery.identity === contextCatalogIdentity(this.config)
+      ? this.lastDiscovery.contextWindows : undefined;
+  }
   async discover(): Promise<ProviderModelConfig[]> {
     while (this.stopBarrier) await this.stopBarrier;
     if (this.busy || this.auxiliaries.size || this.controller?.phase === "active") throw new Error("Model discovery requires an idle provider boundary; no active task is cancelled implicitly");
     if (this.cleanupBlocked) throw this.cleanupBlocked;
     if (this.controller?.phase === "cleanup_failed") throw this.controller.failure;
+    const config = this.config;
+    const identity = contextCatalogIdentity(config);
     const done = Promise.withResolvers<void>();
     const operation = { abort: new AbortController(), done: done.promise };
     this.operation = operation; this.busy = true; this.epoch++;
@@ -160,34 +191,42 @@ export class ProviderRuntime {
         operation.abort.signal.throwIfAborted();
       }
       this.expectedTool = undefined; this.deferredInput = []; this.binding = undefined; this.ledger.clear();
-      controller = await SessionController.open(discoveryConfig(this.config), [], { debug: this.debug }, operation.abort.signal);
+      controller = await SessionController.open(discoveryConfig(config), [], { debug: this.debug, observeModelWindows: true }, operation.abort.signal);
       this.controller = controller;
       operation.abort.signal.throwIfAborted();
       const discovery: ModelDiscovery = { models: await controller.discoverModelOptions(), images: !!controller.capabilities.image, evidence: {} };
       operation.abort.signal.throwIfAborted();
+      const version = controller.runner.evidence.version;
+      // Snapshot before teardown; only exact IDs in this discovery can be published or remembered.
+      // An unprobed producer cannot supply portable evidence for a later activation.
+      const liveWindows = controller.modelContextWindows;
+      const windows = liveWindows?.size && version && version !== "not probed" ? new Map<string, number>() : undefined;
+      if (windows) {
+        for (const { id } of discovery.models) {
+          const capacity = trustedContextWindow(liveWindows, id);
+          if (capacity !== undefined) windows.set(id, capacity);
+        }
+      }
       await controller.stop(new Error("Live model discovery complete"));
       if (controller.phase === "cleanup_failed") throw controller.failure;
       operation.abort.signal.throwIfAborted();
       discovery.evidence = controller.snapshot(); this.controller = undefined;
-      const version = controller.runner.evidence.version;
+      const requested = config.contextWindow;
       const models: ProviderModelConfig[] = [];
       let adjustments = 0;
       for (const model of discovery.models) {
-        const contextWindow = resolveContextWindow(version, model.id, this.config.contextWindow);
-        const limit = contextLimitFor(version, model.id);
-        if (!limit || (this.config.contextWindow !== undefined && contextWindow < this.config.contextWindow)) {
-          if (++adjustments <= 8) this.diagnostic(`AGY context budget for ${JSON.stringify(model.id.slice(0, 128))} (CLI ${JSON.stringify(version.slice(0, 128))}): ${!limit
-            ? `capacity unknown; using local budget ${contextWindow}, not a verified native ceiling.`
-            : `requested ${this.config.contextWindow} clamped to known ceiling ${contextWindow}.`}`);
+        const contextWindow = contextBudget(version, model.id, requested, windows?.get(model.id));
+        if (requested !== undefined && contextWindow < requested && ++adjustments <= 8) {
+          this.diagnostic(`AGY context budget for ${JSON.stringify(model.id.slice(0, 128))} (CLI ${JSON.stringify(version.slice(0, 128))}): requested ${requested} clamped to known ceiling ${contextWindow}.`);
         }
         models.push({ id: model.id, name: `${model.name} (AGY ACP)`,
           ...thinkingMetadata(model.thinking), input: discovery.images ? ["text", "image"] : ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow, maxTokens: this.config.maxTokens });
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow, maxTokens: config.maxTokens });
       }
-      if (adjustments > 8) this.diagnostic(`AGY context budgets: ${adjustments - 8} additional clamped or capacity-unknown live models; only the first 8 details are shown.`);
+      if (adjustments > 8) this.diagnostic(`AGY context budgets: ${adjustments - 8} additional clamped live models; only the first 8 details are shown.`);
       if (!models.length) throw new Error("No models were advertised by this live AGY configuration. No fallback model was registered.");
-      this.lastDiscovery = discovery;
-      this.diagnostic("Live ACP models discovered. Known context ceilings use version-pinned table evidence; unknown capacities use local fallback budgets, not native-capacity claims. Pricing and billed usage are unavailable.");
+      const contextWindows = windows?.size ? Object.freeze({ version, get: (modelId: string) => windows.get(modelId) }) : undefined;
+      this.lastDiscovery = { ...discovery, contextWindows, identity };
       return models;
     } catch (error) {
       if (error instanceof ActivationCleanupError) this.cleanupBlocked = error;
@@ -412,8 +451,10 @@ export class ProviderRuntime {
       signal.throwIfAborted();
       // Contract §4.3 requires model changes to rebuild; selectModel still applies
       // the requested model when session/new initially selects a different default.
-      const binding = canonical({ sessionId: options.sessionId ?? null, cwd: options.cwd ?? process.cwd(), model: model.id,
-        profile: this.config.profile, instructions: this.config.instructions, tools });
+      const cwd = options.cwd ?? process.cwd();
+      const { profile, instructions, allowedModels, runner } = this.config;
+      const binding = canonical({ sessionId: options.sessionId ?? null, cwd, model: model.id,
+        profile, instructions, allowedModels, runner, tools });
       const comparison = this.ledger.compare(context.messages);
       const previous = this.controller;
       const ompSystemPromptChanged = useOmpSystemPrompt && nextPromptDigest !== this.ompSystemPromptDigest;
@@ -663,17 +704,23 @@ export class ProviderRuntime {
     await receipt;
   }
 
+  private rememberedContextWindow(version: string, modelId: string): number | undefined {
+    if (!version || version === "not probed") return undefined;
+    const owner = this.auxiliaryOwner ?? this;
+    // When the host owns the published catalog, a missing snapshot also invalidates local evidence.
+    const remembered = owner.getPublishedContextWindows ? owner.getPublishedContextWindows(version) : owner.discoveredContextWindows;
+    return remembered?.version === version ? remembered.get(modelId) : undefined;
+  }
+
   private validateContextWindow(controller: SessionController, model: Model<Api>): void {
     const version = controller.runner.evidence.version;
-    const budget = resolveContextWindow(version, model.id, this.config.contextWindow);
+    const capacity = trustedContextWindow(controller.modelContextWindows, model.id) ?? this.rememberedContextWindow(version, model.id);
+    const budget = contextBudget(version, model.id, this.config.contextWindow, capacity);
     if (typeof model.contextWindow !== "number") throw new ContextLimitError("Selected AGY model has no numeric contextWindow. Refresh /agy-discover for this configuration; no prompt was submitted.");
     const selected = model.contextWindow;
     if (!Number.isSafeInteger(selected) || selected <= 0) throw new ContextLimitError("Selected AGY model contextWindow must be a positive safe integer; no prompt was submitted.");
     if (selected > budget) throw new ContextLimitError(`Selected AGY model contextWindow ${selected} exceeds this runtime's context budget ${budget}. Refresh /agy-discover for this configuration; no prompt was submitted.`);
     if (!controller.models.some(row => row.id === model.id)) throw new ContextLimitError("Selected AGY model is not advertised by this live ACP configuration. Refresh /agy-discover and choose a live model; no prompt was submitted.");
-    const limit = contextLimitFor(version, model.id);
-    if (!limit) this.diagnostic(`AGY context capacity unknown for ${JSON.stringify(model.id.slice(0, 128))} (CLI ${JSON.stringify(version.slice(0, 128))}); using local budget ${budget}, not a verified native ceiling.`);
-    else if (this.config.contextWindow !== undefined && budget < this.config.contextWindow) this.diagnostic(`AGY requested context budget ${this.config.contextWindow} clamped to known ceiling ${budget} for ${JSON.stringify(model.id.slice(0, 128))}.`);
   }
 
   private async consumeSteering(controller: SessionController, attempt: InputAttempt, options: SimpleStreamOptions, signal: AbortSignal): Promise<void> {

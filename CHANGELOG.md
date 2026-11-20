@@ -4,6 +4,10 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## Unreleased
+
+- 实时模型发现同时观察 AGY 的会话窗口，新模型无需逐版补表；无法确认容量时保留本地预算，不再每次请求提示。过大的旧注册预算仍在提交前拒绝。
+
 ## [0.1.0] - 2026-11-19
 
 首个预发布版本。提供基于 Bun 的官方 Antigravity CLI（`agy`）双向 ACP/MCP 桥接实现，支持零 OMP 依赖的独立核心库入口与 OMP `18.13.1` 扩展适配器。
